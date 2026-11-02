@@ -1,0 +1,89 @@
+name: Auto build NetworkHooks dylib from ZIP
+
+on:
+  push:
+    branches: [main, master]
+    paths:
+      - source.zip
+      - .github/workflows/build-from-zip.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: macos-15
+    timeout-minutes: 25
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Check iOS SDK
+        run: |
+          set -euo pipefail
+          xcodebuild -version
+          xcrun --sdk iphoneos --show-sdk-path
+          test -s source.zip
+
+      - name: Extract required files from source.zip
+        shell: bash
+        run: |
+          python3 - <<'PY'
+          from zipfile import ZipFile
+          from pathlib import Path
+
+          required = ['src/HookConfig.h', 'src/NetworkHooks.m', 'scripts/build_dylib.sh']
+          optional = ['tests/endpoint_check.py']
+          with ZipFile('source.zip') as archive:
+              names = set(archive.namelist())
+              candidates = [
+                  name[:-len('src/NetworkHooks.m')]
+                  for name in names if name.endswith('src/NetworkHooks.m')
+              ]
+              matches = [base for base in candidates if all(base + f in names for f in required)]
+              if len(matches) != 1:
+                  raise SystemExit('ZIP must contain one project with src/ and scripts/')
+              base = matches[0]
+              for name in required + optional:
+                  zip_name = base + name
+                  if zip_name not in names:
+                      if name in required:
+                          raise SystemExit('Missing ' + name)
+                      continue
+                  info = archive.getinfo(zip_name)
+                  if info.file_size > 5_000_000:
+                      raise SystemExit('File too large: ' + name)
+                  target = Path('workspace') / name
+                  target.parent.mkdir(parents=True, exist_ok=True)
+                  target.write_bytes(archive.read(info))
+                  print('Extracted', name)
+          PY
+
+      - name: Validate configuration and build dylib
+        shell: bash
+        run: |
+          set -euo pipefail
+          cd workspace
+          if [ -f tests/endpoint_check.py ]; then
+            python3 tests/endpoint_check.py
+          fi
+          bash scripts/build_dylib.sh
+
+      - name: Verify arm64 and checksum
+        shell: bash
+        run: |
+          set -euo pipefail
+          test -s workspace/dist/NetworkHooks.dylib
+          file workspace/dist/NetworkHooks.dylib
+          xcrun lipo -verify_arch arm64 workspace/dist/NetworkHooks.dylib
+          shasum -a 256 workspace/dist/NetworkHooks.dylib > workspace/dist/NetworkHooks.dylib.sha256
+
+      - name: Upload dylib artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: NetworkHooks-iOS-arm64
+          path: |
+            workspace/dist/NetworkHooks.dylib
+            workspace/dist/NetworkHooks.dylib.sha256
+          if-no-files-found: error
